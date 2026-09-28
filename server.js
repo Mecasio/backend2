@@ -34,12 +34,8 @@ app.use(bodyparser.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 const allowedOrigins = [
-  "http://localhost:5173",
-  "http://192.168.50.211:5173",
-  "http://136.239.248.62:5173",
-  "http://192.168.50.54:5173",
-  "http://192.168.1.9:5173",
-];
+  "http://192.168.5.116:5173", "http://136.239.248.62:5173", "http://127.0.0.1:5173", "http://127.0.0.1", "http://136.239.248.62", "https://ap.earist.edu.ph", "http://ap.earist.edu.ph"
+]; 
 
 app.use(
   cors({

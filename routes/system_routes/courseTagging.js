@@ -1039,7 +1039,7 @@ router.post("/student-tagging", async (req, res) => {
     LEFT JOIN dprtmnt_table AS dt ON dct.dprtmnt_id = dt.dprtmnt_id
     LEFT JOIN year_level_table AS ylt ON ss.year_level_id = ylt.year_level_id
     LEFT JOIN active_school_year_table AS sy ON ss.active_school_year_id = sy.id
-    ${whereClause};
+    ${whereClause} ORDER BY ss.active_school_year_id DESC, ss.id DESC
     `;
 
     const [results] = await db3.query(sql, queryParams);
