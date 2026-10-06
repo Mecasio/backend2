@@ -186,11 +186,282 @@ if (deptNumberRows.length > 0) {
 router.get("/get_department", async (req, res) => {
   try {
     await ensureDepartmentIsAllowedColumn();
-    const [result] = await db3.query("SELECT * FROM dprtmnt_table");
+    const [result] = await db3.query(`
+      SELECT
+        dept.*,
+        dean.employee_id AS dean_employee_id,
+        TRIM(CONCAT_WS(
+          ' ',
+          dean_prof.fname,
+          CASE
+            WHEN NULLIF(TRIM(dean_prof.mname), '') IS NULL THEN NULL
+            ELSE CONCAT(LEFT(TRIM(dean_prof.mname), 1), '.')
+          END,
+          dean_prof.lname
+        )) AS dean_name
+      FROM dprtmnt_table dept
+      LEFT JOIN dprtmnt_org dean
+        ON dean.dprtmnt_id = dept.dprtmnt_id
+       AND dean.position = 'DEAN'
+       AND dean.status = 1
+      LEFT JOIN prof_table dean_prof
+        ON dean_prof.employee_id = dean.employee_id
+      ORDER BY dept.dprtmnt_id
+    `);
     res.status(200).json(result);
   } catch (err) {
     console.error("Error fetching departments:", err);
     res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// -------------------- DEPARTMENT ORGANIZATION --------------------
+router.get("/department/:id/organization", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const [[department]] = await db3.query(
+      `SELECT dprtmnt_id, dprtmnt_name, dprtmnt_code
+       FROM dprtmnt_table
+       WHERE dprtmnt_id = ?
+       LIMIT 1`,
+      [id],
+    );
+
+    if (!department) {
+      return res.status(404).json({ message: "Department not found" });
+    }
+
+    const [curricula] = await db3.query(
+      `SELECT
+         dc.curriculum_id,
+         ct.lock_status,
+         p.program_code,
+         p.program_description,
+         p.major,
+         y.year_description
+       FROM dprtmnt_curriculum_table dc
+       INNER JOIN curriculum_table ct ON ct.curriculum_id = dc.curriculum_id
+       INNER JOIN program_table p ON p.program_id = ct.program_id
+       INNER JOIN year_table y ON y.year_id = ct.year_id
+       WHERE dc.dprtmnt_id = ?
+         AND ct.lock_status = 1
+       ORDER BY p.program_code, y.year_description, dc.curriculum_id`,
+      [id],
+    );
+
+    const [assignments] = await db3.query(
+      `SELECT
+         org.dprtmnt_org_id,
+         org.dprtmnt_id,
+         org.curriculum_id,
+         org.employee_id,
+         org.position,
+         org.start_date,
+         pr.fname,
+         pr.mname,
+         pr.lname,
+         pr.status AS employee_status
+       FROM dprtmnt_org org
+       LEFT JOIN prof_table pr ON pr.employee_id = org.employee_id
+       WHERE org.dprtmnt_id = ? AND org.status = 1
+       ORDER BY org.position, org.curriculum_id`,
+      [id],
+    );
+
+    const assignedEmployeeIds = assignments.map((row) => row.employee_id);
+    const facultyParams = assignedEmployeeIds.length ? assignedEmployeeIds : [""];
+    const [faculty] = await db3.query(
+      `SELECT
+         pr.prof_id,
+         pr.employee_id,
+         pr.fname,
+         pr.mname,
+         pr.lname,
+         pr.status,
+         dept.dprtmnt_id,
+         dept.dprtmnt_name,
+         dept.dprtmnt_code
+       FROM prof_table pr
+       LEFT JOIN (
+         SELECT current_assignment.prof_id, current_assignment.dprtmnt_id
+         FROM dprtmnt_profs_table current_assignment
+         INNER JOIN (
+           SELECT prof_id, MAX(dprtmnt_profs_id) AS latest_id
+           FROM dprtmnt_profs_table
+           GROUP BY prof_id
+         ) latest ON latest.latest_id = current_assignment.dprtmnt_profs_id
+       ) faculty_department ON faculty_department.prof_id = pr.prof_id
+       LEFT JOIN dprtmnt_table dept ON dept.dprtmnt_id = faculty_department.dprtmnt_id
+       WHERE pr.status = 1 OR pr.employee_id IN (?)
+       ORDER BY pr.lname, pr.fname, pr.employee_id`,
+      [facultyParams],
+    );
+
+    return res.json({ department, curricula, assignments, faculty });
+  } catch (err) {
+    console.error("Error fetching department organization:", err);
+    return res.status(500).json({ message: "Failed to load department organization" });
+  }
+});
+
+router.put("/department/:id/organization", CanEdit, async (req, res) => {
+  const { id } = req.params;
+  const deanEmployeeId = String(req.body?.dean_employee_id || "").trim();
+  const chairs = Array.isArray(req.body?.chairs) ? req.body.chairs : [];
+  let connection;
+
+  try {
+    connection = await db3.getConnection();
+    await connection.beginTransaction();
+
+    const [departmentRows] = await connection.query(
+      `SELECT dprtmnt_id, dprtmnt_name, dprtmnt_code
+       FROM dprtmnt_table
+       WHERE dprtmnt_id = ?
+       FOR UPDATE`,
+      [id],
+    );
+
+    if (!departmentRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: "Department not found" });
+    }
+
+    const [curriculumRows] = await connection.query(
+      `SELECT dc.curriculum_id
+       FROM dprtmnt_curriculum_table dc
+       INNER JOIN curriculum_table ct ON ct.curriculum_id = dc.curriculum_id
+       WHERE dc.dprtmnt_id = ?
+         AND ct.lock_status = 1`,
+      [id],
+    );
+    const allowedCurriculumIds = new Set(
+      curriculumRows.map((row) => String(row.curriculum_id)),
+    );
+    const desiredAssignments = new Map();
+
+    if (deanEmployeeId) {
+      desiredAssignments.set("DEAN", {
+        position: "DEAN",
+        curriculumId: null,
+        employeeId: deanEmployeeId,
+      });
+    }
+
+    for (const chair of chairs) {
+      const curriculumId = String(chair?.curriculum_id || "").trim();
+      const chairEmployeeId = String(chair?.employee_id || "").trim();
+
+      if (!curriculumId || !chairEmployeeId) continue;
+      if (!allowedCurriculumIds.has(curriculumId)) {
+        await connection.rollback();
+        return res.status(400).json({
+          message: `Curriculum ${curriculumId} does not belong to this department`,
+        });
+      }
+
+      const key = `PROGRAM_CHAIR:${curriculumId}`;
+      if (desiredAssignments.has(key)) {
+        await connection.rollback();
+        return res.status(400).json({
+          message: `Only one Program Chair can be assigned to curriculum ${curriculumId}`,
+        });
+      }
+
+      desiredAssignments.set(key, {
+        position: "PROGRAM_CHAIR",
+        curriculumId,
+        employeeId: chairEmployeeId,
+      });
+    }
+
+    const desiredEmployeeIds = [
+      ...new Set([...desiredAssignments.values()].map((item) => item.employeeId)),
+    ];
+
+    if (desiredEmployeeIds.length) {
+      const [employeeRows] = await connection.query(
+        `SELECT employee_id
+         FROM prof_table
+         WHERE employee_id IN (?) AND status = 1`,
+        [desiredEmployeeIds],
+      );
+      const activeEmployeeIds = new Set(
+        employeeRows.map((row) => String(row.employee_id)),
+      );
+      const invalidEmployeeId = desiredEmployeeIds.find(
+        (employeeId) => !activeEmployeeIds.has(String(employeeId)),
+      );
+
+      if (invalidEmployeeId) {
+        await connection.rollback();
+        return res.status(400).json({
+          message: `Faculty employee ${invalidEmployeeId} is not active or does not exist`,
+        });
+      }
+    }
+
+    const [currentRows] = await connection.query(
+      `SELECT dprtmnt_org_id, curriculum_id, employee_id, position
+       FROM dprtmnt_org
+       WHERE dprtmnt_id = ? AND status = 1
+       FOR UPDATE`,
+      [id],
+    );
+    const currentAssignments = new Map(
+      currentRows.map((row) => [
+        row.position === "DEAN"
+          ? "DEAN"
+          : `PROGRAM_CHAIR:${row.curriculum_id}`,
+        row,
+      ]),
+    );
+
+    for (const [key, current] of currentAssignments) {
+      const desired = desiredAssignments.get(key);
+      if (!desired || String(desired.employeeId) !== String(current.employee_id)) {
+        await connection.query(
+          `UPDATE dprtmnt_org
+           SET status = 0, end_date = CURRENT_DATE
+           WHERE dprtmnt_org_id = ?`,
+          [current.dprtmnt_org_id],
+        );
+      }
+    }
+
+    for (const [key, desired] of desiredAssignments) {
+      const current = currentAssignments.get(key);
+      if (current && String(current.employee_id) === String(desired.employeeId)) {
+        continue;
+      }
+
+      await connection.query(
+        `INSERT INTO dprtmnt_org
+           (dprtmnt_id, curriculum_id, employee_id, position, start_date, status)
+         VALUES (?, ?, ?, ?, CURRENT_DATE, 1)`,
+        [id, desired.curriculumId, desired.employeeId, desired.position],
+      );
+    }
+
+    await connection.commit();
+
+    const department = departmentRows[0];
+    const { actorId, actorRole } = getAuditActor(req);
+    const roleLabel = formatAuditActorRole(actorRole);
+    await insertDepartmentAuditLog({
+      req,
+      action: "DEPARTMENT_ORGANIZATION_UPDATE",
+      message: `${roleLabel} (${actorId}) updated the organization assignments for ${department.dprtmnt_name} (${department.dprtmnt_code}).`,
+    });
+
+    return res.json({ message: "Department organization saved successfully" });
+  } catch (err) {
+    if (connection) await connection.rollback();
+    console.error("Error saving department organization:", err);
+    return res.status(500).json({ message: "Failed to save department organization" });
+  } finally {
+    if (connection) connection.release();
   }
 });
 

@@ -138,6 +138,7 @@ const buildSectionsQuery = (courseFilter) => `
     pt.program_description,
     st.description AS section_description,
     sst.id AS section_subject_id,
+    sst.tag_source,
     sst.course_id,
     cst.course_code,
     cst.course_description,
@@ -168,6 +169,7 @@ const buildSectionsQuery = (courseFilter) => `
   LEFT JOIN section_subject_table sst
     ON dst.id = sst.department_section_id
     AND sst.active_school_year_id = ?
+    AND sst.is_active = 1
   LEFT JOIN course_table cst ON sst.course_id = cst.course_id
   LEFT JOIN program_tagging_table ptt
     ON ptt.curriculum_id = dst.curriculum_id
@@ -184,8 +186,19 @@ const buildSectionsQuery = (courseFilter) => `
     AND pt.program_id = ?
     AND ct.curriculum_id = ?
     AND pt.components = ?
-    AND dst.year_level_id = ?
-    AND (sst.course_id IS NULL OR ptt.program_tagging_id IS NOT NULL)
+    AND (
+      dst.year_level_id = ?
+      OR (
+        dst.year_level_id IS NULL
+        AND st.description REGEXP CONCAT('(^|[^0-9])', ?, '([^0-9]|$)')
+      )
+    )
+    AND dst.dsstat = 1
+    AND (
+      sst.course_id IS NULL
+      OR sst.tag_source = 'manual'
+      OR ptt.program_tagging_id IS NOT NULL
+    )
     ${courseFilter}
   GROUP BY
     dst.id,
@@ -194,6 +207,7 @@ const buildSectionsQuery = (courseFilter) => `
     pt.program_description,
     st.description,
     sst.id,
+    sst.tag_source,
     sst.course_id,
     cst.course_code,
     cst.course_description,
@@ -241,6 +255,7 @@ router.get("/section-slot/sections", async (req, res) => {
     programId,
     curriculumId,
     campus,
+    yearLevelId,
     yearLevelId,
   ];
   const courseFilter = courseId ? "AND sst.course_id = ?" : "";
@@ -298,6 +313,7 @@ router.get("/slot-monitoring-sections", async (req, res) => {
     programId,
     curriculumId,
     campus,
+    yearLevelId,
     yearLevelId,
   ];
   const courseFilter = courseId ? "AND sst.course_id = ?" : "";
@@ -401,6 +417,209 @@ router.post("/slot-monitoring-enrolled-count", async (req, res) => {
   }
 });
 
+router.post("/section-slot/sync-program", CanCreate, async (req, res) => {
+  const {
+    departmentId,
+    programId,
+    curriculumId,
+    yearLevelId,
+    semesterId,
+    campus,
+    activeSchoolYearId,
+  } = req.body;
+
+  if (
+    !departmentId ||
+    !programId ||
+    !curriculumId ||
+    !yearLevelId ||
+    !semesterId ||
+    !campus ||
+    !activeSchoolYearId
+  ) {
+    return res.status(400).json({
+      error:
+        "departmentId, programId, curriculumId, yearLevelId, semesterId, campus, and activeSchoolYearId are required",
+    });
+  }
+
+  let connection;
+  try {
+    connection = await db3.getConnection();
+    await connection.beginTransaction();
+
+    const [sections] = await connection.query(
+      `SELECT DISTINCT dst.id AS department_section_id
+       FROM dprtmnt_section_table dst
+       INNER JOIN dprtmnt_curriculum_table dct
+         ON dst.curriculum_id = dct.curriculum_id
+       INNER JOIN curriculum_table ct
+         ON dst.curriculum_id = ct.curriculum_id
+       INNER JOIN program_table pt
+         ON ct.program_id = pt.program_id
+       INNER JOIN section_table st
+         ON dst.section_id = st.id
+       WHERE dct.dprtmnt_id = ?
+         AND pt.program_id = ?
+         AND dst.curriculum_id = ?
+         AND pt.components = ?
+         AND dst.dsstat = 1
+         AND (
+           dst.year_level_id = ?
+           OR (
+             dst.year_level_id IS NULL
+             AND st.description REGEXP CONCAT('(^|[^0-9])', ?, '([^0-9]|$)')
+           )
+         )`,
+      [departmentId, programId, curriculumId, campus, yearLevelId, yearLevelId],
+    );
+
+    const [programCourses] = await connection.query(
+      `SELECT DISTINCT course_id
+       FROM program_tagging_table
+       WHERE curriculum_id = ?
+         AND year_level_id = ?
+         AND semester_id = ?`,
+      [curriculumId, yearLevelId, semesterId],
+    );
+
+    const sectionIds = sections.map((row) => Number(row.department_section_id));
+    const courseIds = programCourses.map((row) => Number(row.course_id));
+    const { actorId, actorRole } = getAuditActor(req);
+    let insertedCount = 0;
+    let deactivatedCount = 0;
+    let preservedCount = 0;
+
+    if (sectionIds.length > 0 && courseIds.length > 0) {
+      const values = sectionIds.flatMap((sectionId) =>
+        courseIds.map((courseId) => [
+          sectionId,
+          courseId,
+          curriculumId,
+          activeSchoolYearId,
+          yearLevelId,
+          semesterId,
+          actorId,
+          "automatic",
+          1,
+        ]),
+      );
+      const valuePlaceholders = values.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+      const [insertResult] = await connection.query(
+        `INSERT INTO section_subject_table
+          (department_section_id, course_id, curriculum_id, active_school_year_id,
+           year_level_id, semester_id, tagged_by, tag_source, is_active)
+         VALUES ${valuePlaceholders}
+         ON DUPLICATE KEY UPDATE
+           is_active = IF(excluded_by = 'program-sync', 1, is_active),
+           excluded_by = IF(excluded_by = 'program-sync', NULL, excluded_by),
+           excluded_at = IF(excluded_by = 'program-sync', NULL, excluded_at)`,
+        values.flat(),
+      );
+      insertedCount = insertResult.affectedRows;
+    }
+
+    if (sectionIds.length > 0) {
+      const sectionPlaceholders = sectionIds.map(() => "?").join(", ");
+      const desiredFilter = courseIds.length > 0
+        ? `AND sst.course_id NOT IN (${courseIds.map(() => "?").join(", ")})`
+        : "";
+      const staleParams = [
+        ...sectionIds,
+        activeSchoolYearId,
+        curriculumId,
+        ...courseIds,
+      ];
+
+      const [[staleSummary]] = await connection.query(
+        `SELECT
+           COUNT(*) AS stale_count,
+           SUM(
+             CASE WHEN EXISTS (
+               SELECT 1 FROM enrolled_subject es
+               WHERE es.department_section_id = sst.department_section_id
+                 AND es.course_id = sst.course_id
+                 AND es.active_school_year_id = sst.active_school_year_id
+             ) OR EXISTS (
+               SELECT 1 FROM time_table tt
+               WHERE tt.department_section_id = sst.department_section_id
+                 AND tt.course_id = sst.course_id
+                 AND tt.school_year_id = sst.active_school_year_id
+             ) THEN 1 ELSE 0 END
+           ) AS preserved_count
+         FROM section_subject_table sst
+         WHERE sst.department_section_id IN (${sectionPlaceholders})
+           AND sst.active_school_year_id = ?
+           AND sst.curriculum_id = ?
+           AND sst.tag_source = 'automatic'
+           AND sst.is_active = 1
+           ${desiredFilter}`,
+        staleParams,
+      );
+      preservedCount = Number(staleSummary?.preserved_count) || 0;
+
+      const [deactivateResult] = await connection.query(
+        `UPDATE section_subject_table sst
+         SET sst.is_active = 0,
+             sst.excluded_by = 'program-sync',
+             sst.excluded_at = NOW()
+         WHERE sst.department_section_id IN (${sectionPlaceholders})
+           AND sst.active_school_year_id = ?
+           AND sst.curriculum_id = ?
+           AND sst.tag_source = 'automatic'
+           AND sst.is_active = 1
+           ${desiredFilter}
+           AND NOT EXISTS (
+             SELECT 1 FROM enrolled_subject es
+             WHERE es.department_section_id = sst.department_section_id
+               AND es.course_id = sst.course_id
+               AND es.active_school_year_id = sst.active_school_year_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM time_table tt
+             WHERE tt.department_section_id = sst.department_section_id
+               AND tt.course_id = sst.course_id
+               AND tt.school_year_id = sst.active_school_year_id
+           )`,
+        staleParams,
+      );
+      deactivatedCount = deactivateResult.affectedRows;
+    }
+
+    await connection.commit();
+
+    if (insertedCount > 0 || deactivatedCount > 0) {
+      const roleLabel = formatAuditActorRole(actorRole);
+      await insertSectionSlotAuditLog({
+        req,
+        action: "SECTION_SUBJECT_AUTO_SYNC",
+        message:
+          `${roleLabel} (${actorId}) synchronized Program Tagging subjects to ` +
+          `${sectionIds.length} active section(s): ${insertedCount} added, ` +
+          `${deactivatedCount} removed, ${preservedCount} retained because they are in use.`,
+      });
+    }
+
+    return res.status(200).json({
+      message: "Program subjects synchronized successfully",
+      section_count: sectionIds.length,
+      program_course_count: courseIds.length,
+      inserted_count: insertedCount,
+      deactivated_count: deactivatedCount,
+      preserved_count: preservedCount,
+    });
+  } catch (err) {
+    if (connection) await connection.rollback();
+    console.error("Error synchronizing Program Tagging subjects:", err);
+    return res.status(500).json({
+      error: "Database error",
+      details: err.message,
+    });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 router.get("/section-slot/tagged-subjects/:departmentSectionId", async (req, res) => {
   const { departmentSectionId } = req.params;
   const { activeSchoolYearId } = req.query;
@@ -419,17 +638,21 @@ router.get("/section-slot/tagged-subjects/:departmentSectionId", async (req, res
         sst.course_id,
         sst.curriculum_id,
         sst.active_school_year_id,
+        sst.tag_source,
         cst.course_code,
         cst.course_description,
-        CASE WHEN tt.id IS NOT NULL THEN 1 ELSE 0 END AS has_schedule
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM time_table tt
+          WHERE tt.department_section_id = sst.department_section_id
+            AND tt.course_id = sst.course_id
+            AND tt.school_year_id = sst.active_school_year_id
+        ) THEN 1 ELSE 0 END AS has_schedule
       FROM section_subject_table sst
       INNER JOIN course_table cst ON sst.course_id = cst.course_id
-      LEFT JOIN time_table tt
-        ON tt.department_section_id = sst.department_section_id
-        AND tt.course_id = sst.course_id
-        AND tt.school_year_id = sst.active_school_year_id
       WHERE sst.department_section_id = ?
         AND sst.active_school_year_id = ?
+        AND sst.is_active = 1
       ORDER BY cst.course_code ASC`,
       [departmentSectionId, activeSchoolYearId],
     );
@@ -508,9 +731,16 @@ router.post("/section-slot/tag", CanCreate, async (req, res) => {
 
     for (const courseId of uniqueCourseIds) {
       const [result] = await db3.query(
-        `INSERT IGNORE INTO section_subject_table
-          (department_section_id, course_id, curriculum_id, active_school_year_id, year_level_id, semester_id, tagged_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO section_subject_table
+          (department_section_id, course_id, curriculum_id, active_school_year_id,
+           year_level_id, semester_id, tagged_by, tag_source, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', 1)
+         ON DUPLICATE KEY UPDATE
+           tag_source = 'manual',
+           is_active = 1,
+           tagged_by = VALUES(tagged_by),
+           excluded_by = NULL,
+           excluded_at = NULL`,
         [
           department_section_id,
           courseId,
@@ -553,9 +783,10 @@ router.get("/section-slot/tag/:id/check", async (req, res) => {
 
   try {
     const [[tag]] = await db3.query(
-      `SELECT department_section_id, course_id, active_school_year_id
+      `SELECT department_section_id, course_id, active_school_year_id, tag_source
        FROM section_subject_table
        WHERE id = ?
+         AND is_active = 1
        LIMIT 1`,
       [id],
     );
@@ -585,6 +816,7 @@ router.get("/section-slot/tag/:id/check", async (req, res) => {
     return res.status(200).json({
       enrolled_count: Number(enrolled?.enrolled_count) || 0,
       has_schedule: Number(schedule?.schedule_count) > 0,
+      tag_source: tag.tag_source,
     });
   } catch (err) {
     console.error("Error checking tagged subject:", err);
@@ -601,6 +833,7 @@ router.delete("/section-slot/tag/:id", CanDelete, async (req, res) => {
   try {
     const [[tag]] = await db3.query(
       `SELECT sst.id, sst.department_section_id, sst.course_id, sst.active_school_year_id,
+              sst.tag_source,
               cst.course_code, cst.course_description
        FROM section_subject_table sst
        LEFT JOIN course_table cst ON sst.course_id = cst.course_id
@@ -629,17 +862,28 @@ router.delete("/section-slot/tag/:id", CanDelete, async (req, res) => {
       });
     }
 
-    await db3.query(`DELETE FROM section_subject_table WHERE id = ?`, [id]);
-
     const { actorId, actorRole } = getAuditActor(req);
     const roleLabel = formatAuditActorRole(actorRole);
     const sectionLabel = await getSectionLabel(tag.department_section_id);
     const courseLabel = `${tag.course_code || ""} - ${tag.course_description || ""}`.trim();
 
+    if (tag.tag_source === "automatic") {
+      await db3.query(
+        `UPDATE section_subject_table
+         SET is_active = 0, excluded_by = ?, excluded_at = NOW()
+         WHERE id = ?`,
+        [actorId, id],
+      );
+    } else {
+      await db3.query(`DELETE FROM section_subject_table WHERE id = ?`, [id]);
+    }
+
     await insertSectionSlotAuditLog({
       req,
       action: "SECTION_SUBJECT_UNTAG",
-      message: `${roleLabel} (${actorId}) removed ${courseLabel} from ${sectionLabel}.`,
+      message:
+        `${roleLabel} (${actorId}) removed ${courseLabel} from ${sectionLabel}` +
+        `${tag.tag_source === "automatic" ? " as a section override" : ""}.`,
     });
 
     return res.status(200).json({ message: "Subject untagged successfully" });

@@ -17,6 +17,45 @@ const {
 
 const router = express.Router();
 
+const REGISTRAR_COURSE_TAGGING_PAGE_ID = 17;
+const REGISTRAR_COURSE_TAGGING_ROLES = new Set([
+  "administrator",
+  "superadmin",
+  "technical",
+]);
+
+const requireRegistrarCourseTaggingAccess = async (req, res, next) => {
+  const role = String(req.user?.role || "").trim().toLowerCase();
+  const employeeId = req.user?.employee_id;
+
+  if (!REGISTRAR_COURSE_TAGGING_ROLES.has(role) || !employeeId) {
+    return res.status(403).json({
+      error: "You are not authorized to access registrar course tagging.",
+    });
+  }
+
+  try {
+    const [accessRows] = await db3.query(
+      `SELECT page_privilege
+       FROM page_access
+       WHERE user_id = ? AND page_id = ? AND page_privilege = 1
+       LIMIT 1`,
+      [employeeId, REGISTRAR_COURSE_TAGGING_PAGE_ID],
+    );
+
+    if (!accessRows.length) {
+      return res.status(403).json({
+        error: "You do not have page access to registrar course tagging.",
+      });
+    }
+
+    return next();
+  } catch (err) {
+    console.error("Error checking registrar course tagging access:", err);
+    return res.status(500).json({ error: "Failed to verify page access." });
+  }
+};
+
 const formatAuditActorRole = (role) => {
   const safeRole = String(role || "registrar").trim();
   if (!safeRole) return "Registrar";
@@ -306,6 +345,82 @@ router.get("/courses/:currId", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// ALL UNIQUE COURSES FROM ACTIVE CURRICULA IN A DEPARTMENT
+router.get(
+  "/department-active-courses/:departmentId",
+  requireRegistrarCourseTaggingAccess,
+  async (req, res) => {
+    const { departmentId } = req.params;
+
+    if (!departmentId || !/^\d+$/.test(String(departmentId))) {
+      return res.status(400).json({ error: "A valid department ID is required." });
+    }
+
+    try {
+      const [rows] = await db3.query(
+        `
+        SELECT
+          ctt.program_tagging_id,
+          ctt.curriculum_id,
+          ctt.course_id,
+          ctt.year_level_id,
+          ctt.semester_id,
+          c.course_code,
+          c.course_description,
+          c.course_unit,
+          c.lec_unit,
+          c.lab_unit,
+          c.prereq,
+          c.corequisite,
+          c.subject_type_id,
+          st.subject_type_name,
+          c.category_type_id,
+          cat.category_type_name
+        FROM dprtmnt_curriculum_table dc
+        INNER JOIN curriculum_table ct
+          ON ct.curriculum_id = dc.curriculum_id
+         AND ct.lock_status = 1
+        INNER JOIN program_tagging_table ctt
+          ON ctt.curriculum_id = ct.curriculum_id
+        INNER JOIN course_table c
+          ON c.course_id = ctt.course_id
+        LEFT JOIN subject_type_table st
+          ON st.subject_type_id = c.subject_type_id
+        LEFT JOIN category_type_table cat
+          ON cat.category_type_id = c.category_type_id
+        WHERE dc.dprtmnt_id = ?
+        ORDER BY c.course_code, ctt.curriculum_id, ctt.year_level_id, ctt.semester_id
+        `,
+        [departmentId],
+      );
+
+      const uniqueCourses = new Map();
+      rows.forEach((course) => {
+        const key = String(course.course_id);
+        if (!uniqueCourses.has(key)) {
+          uniqueCourses.set(key, {
+            ...course,
+            prereq_list: course.prereq
+              ? String(course.prereq)
+                  .split(",")
+                  .map((value) => value.trim())
+                  .filter(Boolean)
+              : [],
+          });
+        }
+      });
+
+      return res.json(Array.from(uniqueCourses.values()));
+    } catch (err) {
+      console.error("Error fetching department active courses:", err);
+      return res.status(500).json({
+        error: "Failed to retrieve department courses.",
+        details: err.message,
+      });
+    }
+  },
+);
 
 // COURSES BY DEPARTMENT
 router.get("/other-departments", async (req, res) => {
@@ -1734,6 +1849,7 @@ router.get("/department-sections", async (req, res) => {
       ds.id as department_and_program_section_id,
       ds.section_id,
       ds.year_level_id,
+      ds.dsstat,
       pt.program_description,
       pt.program_code,
       pt.major,
@@ -1745,6 +1861,8 @@ router.get("/department-sections", async (req, res) => {
         INNER JOIN program_table as pt ON c.program_id = pt.program_id
         INNER JOIN section_table as st ON st.id = ds.section_id
       WHERE dt.dprtmnt_id = ?
+        AND c.lock_status = 1
+        AND ds.dsstat = 1
     ORDER BY ds.id
   `;
 

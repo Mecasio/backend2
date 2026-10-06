@@ -223,7 +223,7 @@ router.get("/section_table/:dprtmnt_id", async (req, res) => {
 
   try {
     const query = `
-      SELECT dst.id AS dep_section_id, dst.curriculum_id, st.*, pt.*
+      SELECT dst.id AS dep_section_id, dst.curriculum_id, dst.dsstat, st.*, pt.*
       FROM dprtmnt_curriculum_table AS dct
       INNER JOIN dprtmnt_section_table AS dst ON dct.curriculum_id = dst.curriculum_id
       INNER JOIN section_table AS st ON dst.section_id = st.id
