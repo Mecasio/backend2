@@ -10,6 +10,24 @@ const toPositiveInteger = (value) => {
 
 const isAll = (value) => !value || String(value).toLowerCase() === "all";
 
+const parseDateFilter = (value) => {
+  const date = String(value || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date
+    ? date
+    : null;
+};
+
+const STUDENT_NAME_EXPRESSION = `TRIM(CONCAT(
+  COALESCE(person.last_name, ''),
+  CASE WHEN COALESCE(person.last_name, '') <> '' THEN ', ' ELSE '' END,
+  COALESCE(person.first_name, ''),
+  CASE WHEN COALESCE(person.middle_name, '') <> '' THEN CONCAT(' ', person.middle_name) ELSE '' END,
+  CASE WHEN COALESCE(person.extension, '') <> '' THEN CONCAT(' ', person.extension) ELSE '' END
+))`;
+
 const buildReportSource = ({
   type,
   campusId,
@@ -17,6 +35,8 @@ const buildReportSource = ({
   curriculumId,
   yearLevelId,
   sectionId,
+  startDate,
+  endDate,
 }) => {
   const conditions = [
     "es.active_school_year_id = ?",
@@ -28,7 +48,17 @@ const buildReportSource = ({
   if (type === "migrated") {
     conditions.push("LOWER(TRIM(COALESCE(es.remarks, ''))) = 'migrated from old system'");
   } else {
-    conditions.push("es.department_section_id IS NOT NULL", "es.department_section_id <> 0");
+    conditions.push(
+      "es.department_section_id IS NOT NULL",
+      "es.department_section_id <> 0",
+      `EXISTS (
+        SELECT 1
+        FROM unifast AS u
+        WHERE u.student_number = es.student_number
+          AND u.active_school_year_id = es.active_school_year_id
+          AND u.status = 1
+      )`,
+    );
   }
 
   if (!isAll(curriculumId)) {
@@ -44,6 +74,16 @@ const buildReportSource = ({
   if (type === "enrolled" && !isAll(sectionId)) {
     conditions.push("es.department_section_id = ?");
     params.push(sectionId);
+  }
+
+  if (startDate) {
+    conditions.push("es.created_at >= ?");
+    params.push(`${startDate} 00:00:00`);
+  }
+
+  if (endDate) {
+    conditions.push("es.created_at < DATE_ADD(?, INTERVAL 1 DAY)");
+    params.push(`${endDate} 00:00:00`);
   }
 
   return {
@@ -87,6 +127,8 @@ const getReport = async (req, res, type) => {
   const page = Math.max(toPositiveInteger(req.query.page) || 1, 1);
   const pageSize = Math.min(Math.max(toPositiveInteger(req.query.pageSize) || 25, 1), 100);
   const search = String(req.query.search || "").trim();
+  const startDate = parseDateFilter(req.query.startDate);
+  const endDate = parseDateFilter(req.query.endDate);
 
   if (!campusId || !activeSchoolYearId) {
     return res.status(400).json({
@@ -98,6 +140,14 @@ const getReport = async (req, res, type) => {
     return res.status(400).json({ error: "Invalid report filter" });
   }
 
+  if ((req.query.startDate && !startDate) || (req.query.endDate && !endDate)) {
+    return res.status(400).json({ error: "Dates must use the YYYY-MM-DD format" });
+  }
+
+  if (startDate && endDate && startDate > endDate) {
+    return res.status(400).json({ error: "Start date cannot be after end date" });
+  }
+
   try {
     const source = buildReportSource({
       type,
@@ -106,6 +156,8 @@ const getReport = async (req, res, type) => {
       curriculumId,
       yearLevelId,
       sectionId,
+      startDate,
+      endDate,
     });
 
     const [curriculumRows] = await db3.query(
@@ -154,15 +206,8 @@ const getReport = async (req, res, type) => {
       source.params,
     );
 
-    const nameExpression = `TRIM(CONCAT(
-      COALESCE(person.last_name, ''),
-      CASE WHEN COALESCE(person.last_name, '') <> '' THEN ', ' ELSE '' END,
-      COALESCE(person.first_name, ''),
-      CASE WHEN COALESCE(person.middle_name, '') <> '' THEN CONCAT(' ', person.middle_name) ELSE '' END,
-      CASE WHEN COALESCE(person.extension, '') <> '' THEN CONCAT(' ', person.extension) ELSE '' END
-    ))`;
     const searchCondition = search
-      ? `WHERE base.student_number LIKE ? OR ${nameExpression} LIKE ?`
+      ? `WHERE base.student_number LIKE ? OR ${STUDENT_NAME_EXPRESSION} LIKE ?`
       : "";
     const searchParams = search ? [`%${search}%`, `%${search}%`] : [];
 
@@ -184,15 +229,43 @@ const getReport = async (req, res, type) => {
 
     const [studentRows] = await db3.query(
       `
-        SELECT DISTINCT
+        SELECT
           base.student_number,
-          ${nameExpression} AS student_full_name
+          ${STUDENT_NAME_EXPRESSION} AS student_full_name,
+          GROUP_CONCAT(
+            DISTINCT CONCAT(
+              pt.program_code,
+              ' - ',
+              pt.program_description,
+              CASE
+                WHEN COALESCE(pt.major, '') <> '' THEN CONCAT(' - ', pt.major)
+                ELSE ''
+              END,
+              ' (Curriculum ',
+              yt.year_description,
+              ')'
+            )
+            ORDER BY pt.program_code, yt.year_description DESC
+            SEPARATOR '; '
+          ) AS curriculum_name
         FROM (${source.sql}) AS base
         INNER JOIN student_numbering_table AS numbering
           ON numbering.student_number = base.student_number
         INNER JOIN person_table AS person
           ON person.person_id = numbering.person_id
+        INNER JOIN curriculum_table AS ct
+          ON ct.curriculum_id = base.curriculum_id
+        INNER JOIN program_table AS pt
+          ON pt.program_id = ct.program_id
+        INNER JOIN year_table AS yt
+          ON yt.year_id = ct.year_id
         ${searchCondition}
+        GROUP BY
+          base.student_number,
+          person.last_name,
+          person.first_name,
+          person.middle_name,
+          person.extension
         ORDER BY person.last_name, person.first_name, person.middle_name, base.student_number
         LIMIT ? OFFSET ?
       `,
@@ -213,6 +286,107 @@ const getReport = async (req, res, type) => {
   } catch (error) {
     console.error(`Failed to load ${type} report:`, error);
     return res.status(500).json({ error: `Failed to load ${type} report` });
+  }
+};
+
+const exportReport = async (req, res, type) => {
+  const campusId = toPositiveInteger(req.query.campusId);
+  const activeSchoolYearId = toPositiveInteger(req.query.activeSchoolYearId);
+  const curriculumId = isAll(req.query.curriculumId)
+    ? "all"
+    : toPositiveInteger(req.query.curriculumId);
+  const yearLevelId = isAll(req.query.yearLevelId)
+    ? "all"
+    : toPositiveInteger(req.query.yearLevelId);
+  const sectionId = isAll(req.query.sectionId)
+    ? "all"
+    : toPositiveInteger(req.query.sectionId);
+  const search = String(req.query.search || "").trim();
+  const startDate = parseDateFilter(req.query.startDate);
+  const endDate = parseDateFilter(req.query.endDate);
+
+  if (!campusId || !activeSchoolYearId) {
+    return res.status(400).json({
+      error: "campusId and activeSchoolYearId are required",
+    });
+  }
+
+  if (!curriculumId || !yearLevelId || (type === "enrolled" && !sectionId)) {
+    return res.status(400).json({ error: "Invalid report filter" });
+  }
+
+  if ((req.query.startDate && !startDate) || (req.query.endDate && !endDate)) {
+    return res.status(400).json({ error: "Dates must use the YYYY-MM-DD format" });
+  }
+
+  if (startDate && endDate && startDate > endDate) {
+    return res.status(400).json({ error: "Start date cannot be after end date" });
+  }
+
+  try {
+    const source = buildReportSource({
+      type,
+      campusId,
+      activeSchoolYearId,
+      curriculumId,
+      yearLevelId,
+      sectionId,
+      startDate,
+      endDate,
+    });
+    const searchCondition = search
+      ? `WHERE base.student_number LIKE ? OR ${STUDENT_NAME_EXPRESSION} LIKE ?`
+      : "";
+    const searchParams = search ? [`%${search}%`, `%${search}%`] : [];
+
+    const [students] = await db3.query(
+      `
+        SELECT
+          base.student_number,
+          ${STUDENT_NAME_EXPRESSION} AS student_full_name,
+          GROUP_CONCAT(
+            DISTINCT CONCAT(
+              pt.program_code,
+              ' - ',
+              pt.program_description,
+              CASE
+                WHEN COALESCE(pt.major, '') <> '' THEN CONCAT(' - ', pt.major)
+                ELSE ''
+              END,
+              ' (Curriculum ',
+              yt.year_description,
+              ')'
+            )
+            ORDER BY pt.program_code, yt.year_description DESC
+            SEPARATOR '; '
+          ) AS curriculum_name
+        FROM (${source.sql}) AS base
+        INNER JOIN student_numbering_table AS numbering
+          ON numbering.student_number = base.student_number
+        INNER JOIN person_table AS person
+          ON person.person_id = numbering.person_id
+        INNER JOIN curriculum_table AS ct
+          ON ct.curriculum_id = base.curriculum_id
+        INNER JOIN program_table AS pt
+          ON pt.program_id = ct.program_id
+        INNER JOIN year_table AS yt
+          ON yt.year_id = ct.year_id
+        ${searchCondition}
+        GROUP BY
+          base.student_number,
+          person.last_name,
+          person.first_name,
+          person.middle_name,
+          person.extension
+        ORDER BY person.last_name, person.first_name, person.middle_name, base.student_number
+      `,
+      [...source.params, ...searchParams],
+    );
+
+    return res.json({ students });
+  } catch (error) {
+    console.error(`Failed to export ${type} report:`, error);
+    return res.status(500).json({ error: `Failed to export ${type} report` });
   }
 };
 
@@ -337,5 +511,7 @@ router.get("/reports/filter-options", async (req, res) => {
 
 router.get("/reports/migrated", (req, res) => getReport(req, res, "migrated"));
 router.get("/reports/enrolled", (req, res) => getReport(req, res, "enrolled"));
+router.get("/reports/migrated/export", (req, res) => exportReport(req, res, "migrated"));
+router.get("/reports/enrolled/export", (req, res) => exportReport(req, res, "enrolled"));
 
 module.exports = router;

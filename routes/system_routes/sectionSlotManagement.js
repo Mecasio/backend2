@@ -160,7 +160,7 @@ const buildSectionsQuery = (courseFilter) => `
       ORDER BY prf.lname, prf.fname
       SEPARATOR ', '
     ) AS faculty_name,
-    COALESCE(sst.max_slots, dst.max_slots) AS max_slots
+    COALESCE(sst.max_slots, 0) AS max_slots
   FROM dprtmnt_section_table dst
   INNER JOIN dprtmnt_curriculum_table dct ON dst.curriculum_id = dct.curriculum_id
   INNER JOIN section_table st ON dst.section_id = st.id
@@ -212,7 +212,7 @@ const buildSectionsQuery = (courseFilter) => `
     cst.course_code,
     cst.course_description,
     ylt.year_level_description,
-    COALESCE(sst.max_slots, dst.max_slots)
+    COALESCE(sst.max_slots, 0)
   ORDER BY st.description ASC, cst.course_code ASC
 `;
 
@@ -944,100 +944,6 @@ router.put("/section-slot/tag/:id/max-slots", CanEdit, async (req, res) => {
     return res.status(200).json({ message: "Max slots updated successfully" });
   } catch (err) {
     console.error("Error updating subject max slots:", err);
-    return res.status(500).json({
-      error: "Database error",
-      details: err.message,
-    });
-  }
-});
-
-router.put("/section-slot/sections/:departmentSectionId/max-slots", CanEdit, async (req, res) => {
-  const { departmentSectionId } = req.params;
-  const { max_slots } = req.body;
-  const parsedSlots = Number(max_slots);
-
-  if (
-    !departmentSectionId ||
-    Number.isNaN(parsedSlots) ||
-    parsedSlots < 0
-  ) {
-    return res.status(400).json({
-      error:
-        "departmentSectionId is required and max_slots must be a non-negative number",
-    });
-  }
-
-  try {
-    const beforeLabel = await getSectionLabel(departmentSectionId);
-
-    const [result] = await db3.query(
-      `UPDATE dprtmnt_section_table SET max_slots = ? WHERE id = ?`,
-      [parsedSlots, departmentSectionId],
-    );
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: "Department section not found" });
-    }
-
-    const { actorId, actorRole } = getAuditActor(req);
-    const roleLabel = formatAuditActorRole(actorRole);
-
-    await insertSectionSlotAuditLog({
-      req,
-      action: "SECTION_SLOT_UPDATE",
-      message: `${roleLabel} (${actorId}) changed max slots of ${beforeLabel} to ${parsedSlots}.`,
-    });
-
-    return res.status(200).json({ message: "Max slots updated successfully" });
-  } catch (err) {
-    console.error("Error updating max slots:", err);
-    return res.status(500).json({
-      error: "Database error",
-      details: err.message,
-    });
-  }
-});
-
-router.put("/slot-monitoring-sections/:departmentSectionId/max-slots", CanEdit, async (req, res) => {
-  const { departmentSectionId } = req.params;
-  const { max_slots } = req.body;
-  const parsedSlots = Number(max_slots);
-
-  if (
-    !departmentSectionId ||
-    Number.isNaN(parsedSlots) ||
-    parsedSlots < 0
-  ) {
-    return res.status(400).json({
-      error:
-        "departmentSectionId is required and max_slots must be a non-negative number",
-    });
-  }
-
-  try {
-    const beforeLabel = await getSectionLabel(departmentSectionId);
-
-    const [result] = await db3.query(
-      `UPDATE dprtmnt_section_table SET max_slots = ? WHERE id = ?`,
-      [parsedSlots, departmentSectionId],
-    );
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: "Department section not found" });
-    }
-
-    const { actorId, actorRole } = getAuditActor(req);
-    const roleLabel = formatAuditActorRole(actorRole);
-
-    await insertSectionSlotAuditLog({
-      req,
-      action: "SECTION_SLOT_UPDATE",
-      message: `${roleLabel} (${actorId}) changed max slots of ${beforeLabel} to ${parsedSlots}.`,
-    });
-
-    return res.status(200).json({ message: "Max slots updated successfully" });
-  } catch (err) {
-    console.error("Error updating max slots:", err);
     return res.status(500).json({
       error: "Database error",
       details: err.message,

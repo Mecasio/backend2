@@ -45,8 +45,7 @@ const getDepartmentSectionLabel = async (departmentSectionId) => {
   const [[details]] = await db3.query(
     `SELECT y.year_description, p.program_code, p.program_description, p.major,
             st.description AS section_description,
-            yl.year_level_description,
-            dst.max_slots
+            yl.year_level_description
      FROM dprtmnt_section_table dst
      INNER JOIN curriculum_table c ON dst.curriculum_id = c.curriculum_id
      INNER JOIN year_table y ON c.year_id = y.year_id
@@ -71,9 +70,7 @@ const getDepartmentSectionLabel = async (departmentSectionId) => {
     ? ` (${details.year_level_description})`
     : "";
 
-  const slotsLabel = ` [Max Slots: ${details.max_slots ?? 0}]`;
-
-  return `${programLabel} - ${details.section_description}${yearLevelLabel}${slotsLabel}`;
+  return `${programLabel} - ${details.section_description}${yearLevelLabel}`;
 };
 
 // ACTIVE CURRICULUM
@@ -244,21 +241,13 @@ router.get("/section_table/:dprtmnt_id", async (req, res) => {
 
 // DEPARTMENT SECTION - CREATE
 router.post("/department_section", CanCreate, async (req, res) => {
-  const {
-    curriculum_id,
-    section_id,
-    year_level_id,
-    max_slots,
-  } = req.body;
+  const { curriculum_id, section_id, year_level_id } = req.body;
 
   if (!curriculum_id || !section_id || !year_level_id) {
     return res
       .status(400)
       .json({ error: "Curriculum ID, Section ID, and Year Level are required" });
   }
-
-  // max_slots defaults to 0 (matches table default)
-  const safeMaxSlots = Number.isFinite(Number(max_slots)) ? Number(max_slots) : 0;
 
   try {
     const [existing] = await db3.query(
@@ -277,15 +266,14 @@ router.post("/department_section", CanCreate, async (req, res) => {
 
     const query = `
       INSERT INTO dprtmnt_section_table
-        (curriculum_id, section_id, year_level_id, max_slots, dsstat)
-      VALUES (?, ?, ?, ?, 0)
+        (curriculum_id, section_id, year_level_id, dsstat)
+      VALUES (?, ?, ?, 0)
     `;
 
     const [result] = await db3.query(query, [
       curriculum_id,
       section_id,
       year_level_id,
-      safeMaxSlots,
     ]);
 
     const [[details]] = await db3.query(
@@ -311,7 +299,7 @@ router.post("/department_section", CanCreate, async (req, res) => {
     await insertDepartmentSectionAuditLog({
       req,
       action: "DEPARTMENT_SECTION_CREATE",
-      message: `${roleLabel} (${actorId}) created department section ${curriculumLabel} - ${sectionLabel}${yearLevelLabel} [Max Slots: ${safeMaxSlots}].`,
+      message: `${roleLabel} (${actorId}) created department section ${curriculumLabel} - ${sectionLabel}${yearLevelLabel}.`,
     });
 
     res.status(201).json({
@@ -329,20 +317,13 @@ router.post("/department_section", CanCreate, async (req, res) => {
 // DEPARTMENT SECTION - UPDATE
 router.put("/department_section/:id", CanEdit, async (req, res) => {
   const { id } = req.params;
-  const {
-    curriculum_id,
-    section_id,
-    year_level_id,
-    max_slots,
-  } = req.body;
+  const { curriculum_id, section_id, year_level_id } = req.body;
 
   if (!curriculum_id || !section_id || !year_level_id) {
     return res
       .status(400)
       .json({ error: "Curriculum ID, Section ID, and Year Level are required" });
   }
-
-  const safeMaxSlots = Number.isFinite(Number(max_slots)) ? Number(max_slots) : 0;
 
   try {
     const [existing] = await db3.query(
@@ -363,9 +344,9 @@ router.put("/department_section/:id", CanEdit, async (req, res) => {
 
     const [result] = await db3.query(
       `UPDATE dprtmnt_section_table
-       SET curriculum_id = ?, section_id = ?, year_level_id = ?, max_slots = ?
+       SET curriculum_id = ?, section_id = ?, year_level_id = ?
        WHERE id = ?`,
-      [curriculum_id, section_id, year_level_id, safeMaxSlots, id],
+      [curriculum_id, section_id, year_level_id, id],
     );
 
     if (result.affectedRows === 0) {
@@ -430,7 +411,6 @@ router.get("/department_section", async (req, res) => {
         dst.id as department_section_id,
         dst.dsstat,
         dst.year_level_id,
-        dst.max_slots,
         ylt.year_level_description,
         pt.program_code,
         pt.program_description,

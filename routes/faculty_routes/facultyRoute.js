@@ -168,7 +168,7 @@ router.get("/professors", async (req, res) => {
         ON dpft.prof_id = pft.prof_id
       LEFT JOIN dprtmnt_table AS dpt 
         ON dpft.dprtmnt_id = dpt.dprtmnt_id
-      ORDER BY pft.prof_id ASC
+      ORDER BY pft.prof_id DESC
     `);
 
     res.json(rows);

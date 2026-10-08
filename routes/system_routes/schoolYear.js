@@ -1171,28 +1171,6 @@ router.get("/school-years", async (req, res) => {
   }
 });
 
-
-
-router.get("/school_years", async (req, res) => {
-  try {
-    const [rows] = await db3.query(`
-      SELECT
-        yt.year_description,
-        st.semester_description,
-        sy.astatus
-      FROM school_year_table sy
-      JOIN year_table yt ON sy.year_id = yt.year_id
-      JOIN semester_table st ON sy.semester_id = st.semester_id
-      ORDER BY yt.year_description DESC, st.semester_id ASC
-    `);
-    res.json(rows);
-  } catch (error) {
-    console.error("Error fetching school years:", error);
-    res.status(500).json({ message: "Database error" });
-  }
-});
-
-
 router.get("/year_table", async (req, res) => {
   try {
     const [rows] = await db3.query(
@@ -1204,7 +1182,6 @@ router.get("/year_table", async (req, res) => {
     res.status(500).json({ message: "Database error" });
   }
 });
-
 
 router.get("/semester_table", async (req, res) => {
   try {

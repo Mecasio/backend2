@@ -205,6 +205,128 @@ const getActiveSchoolYearId = async (requestedSchoolYearId) => {
   return rows?.[0]?.id || null;
 };
 
+class SectionCapacityError extends Error {
+  constructor({ enrolledCount, maxSlots }) {
+    super(
+      maxSlots <= 0
+        ? "Enrollment is closed for this subject because no slots are available."
+        : `Section is full for this subject (${enrolledCount}/${maxSlots}).`,
+    );
+    this.name = "SectionCapacityError";
+    this.code = "SECTION_FULL";
+    this.statusCode = 409;
+    this.enrolledCount = enrolledCount;
+    this.maxSlots = maxSlots;
+  }
+}
+
+const sendCourseTaggingError = (res, err) => {
+  if (err?.code === "SECTION_FULL") {
+    return res.status(409).json({
+      error: err.code,
+      message: err.message,
+      enrolled_count: err.enrolledCount,
+      max_slots: err.maxSlots,
+    });
+  }
+
+  if (err?.code === "SECTION_NOT_FOUND") {
+    return res.status(404).json({
+      error: err.code,
+      message: err.message,
+    });
+  }
+
+  return res.status(500).json({
+    error: "Database error",
+    message: err?.message || "Unable to update course enrollment.",
+  });
+};
+
+const assertSectionCapacity = async ({
+  connection,
+  sectionId,
+  courseId,
+  activeSchoolYearId,
+}) => {
+  if (!sectionId) return;
+
+  const [slotRows] = await connection.query(
+    `
+    SELECT
+      dst.id AS department_section_id,
+      COALESCE(sst.max_slots, 0) AS max_slots
+    FROM dprtmnt_section_table dst
+    LEFT JOIN section_subject_table sst
+      ON sst.department_section_id = dst.id
+      AND sst.course_id = ?
+      AND sst.active_school_year_id = ?
+      AND sst.is_active = 1
+    WHERE dst.id = ?
+    ORDER BY sst.id DESC
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [courseId, activeSchoolYearId, sectionId],
+  );
+
+  if (!slotRows.length) {
+    const sectionError = new Error("Selected section was not found.");
+    sectionError.code = "SECTION_NOT_FOUND";
+    throw sectionError;
+  }
+
+  const maxSlots = Number(slotRows[0].max_slots) || 0;
+  const [[countRow]] = await connection.query(
+    `
+    SELECT COUNT(DISTINCT student_number) AS enrolled_count
+    FROM enrolled_subject
+    WHERE department_section_id = ?
+      AND course_id = ?
+      AND active_school_year_id = ?
+    `,
+    [sectionId, courseId, activeSchoolYearId],
+  );
+  const enrolledCount = Number(countRow?.enrolled_count) || 0;
+
+  if (maxSlots <= 0 || enrolledCount >= maxSlots) {
+    throw new SectionCapacityError({ enrolledCount, maxSlots });
+  }
+};
+
+/**
+ * Serializes enrollment changes through the section/subject slot row.
+ * A max_slots value of 0 (or less) means enrollment is closed.
+ */
+const runWithSectionCapacity = async ({
+  sectionId,
+  courseId,
+  activeSchoolYearId,
+  mutation,
+}) => {
+  const connection = await db3.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    await assertSectionCapacity({
+      connection,
+      sectionId,
+      courseId,
+      activeSchoolYearId,
+    });
+
+    const result = await mutation(connection);
+    await connection.commit();
+    return result;
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
+  }
+};
+
 const getStudentSearchFailure = async ({
   studentNumber,
   dprtmntId,
@@ -638,12 +760,41 @@ router.post("/add-all-to-enrolled-courses", async (req, res) => {
         continue;
       }
 
-      await db3.query(
-        `INSERT INTO enrolled_subject
-         (course_id, student_number, active_school_year_id, curriculum_id, department_section_id, status)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [subject_id, user_id, activeSchoolYearId, curriculumID, departmentSectionID, 1],
-      );
+      try {
+        await runWithSectionCapacity({
+          sectionId: departmentSectionID,
+          courseId: subject_id,
+          activeSchoolYearId,
+          mutation: (connection) =>
+            connection.query(
+              `INSERT INTO enrolled_subject
+               (course_id, student_number, active_school_year_id, curriculum_id, department_section_id, status)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              [
+                subject_id,
+                user_id,
+                activeSchoolYearId,
+                curriculumID,
+                departmentSectionID,
+                1,
+              ],
+            ),
+        });
+      } catch (err) {
+        if (err?.code === "SECTION_FULL") {
+          results.push({
+            subject_id,
+            enrolled: false,
+            skipped: true,
+            reason: "SECTION_FULL",
+            message: err.message,
+            enrolled_count: err.enrolledCount,
+            max_slots: err.maxSlots,
+          });
+          continue;
+        }
+        throw err;
+      }
 
       if (isSpecialYearLevel) {
         await db3.query(
@@ -723,11 +874,12 @@ router.post("/add-all-to-enrolled-courses", async (req, res) => {
     res.status(200).json({
       message: "Bulk enrollment processed",
       enrolledCount: enrolledLabels.length,
+      fullCount: results.filter((item) => item.reason === "SECTION_FULL").length,
       results,
     });
   } catch (err) {
     console.error("Error:", err);
-    return res.status(500).json({ error: err.message });
+    return sendCourseTaggingError(res, err);
   }
 });
 
@@ -752,13 +904,19 @@ router.post("/add-to-enrolled-courses/:userId/:currId/", async (req, res) => {
 
     const sql =
       "INSERT INTO enrolled_subject (course_id, student_number, active_school_year_id, curriculum_id, department_section_id) VALUES (?, ?, ?, ?, ?)";
-    await db3.query(sql, [
-      subject_id,
-      userId,
+    await runWithSectionCapacity({
+      sectionId: department_section_id,
+      courseId: subject_id,
       activeSchoolYearId,
-      currId,
-      department_section_id,
-    ]);
+      mutation: (connection) =>
+        connection.query(sql, [
+          subject_id,
+          userId,
+          activeSchoolYearId,
+          currId,
+          department_section_id,
+        ]),
+    });
 
     const [getStudentNUmber] = await db3.query(
       `
@@ -813,7 +971,7 @@ router.post("/add-to-enrolled-courses/:userId/:currId/", async (req, res) => {
 
     res.json({ message: "Course enrolled successfully" });
   } catch (err) {
-    return res.status(500).json(err);
+    return sendCourseTaggingError(res, err);
   }
 });
 
@@ -847,23 +1005,29 @@ router.post(
         activeSchoolYearId = yearResult[0].id;
       }
 
-      await db3.query(
-        `INSERT INTO enrolled_subject
-          (course_id, student_number, active_school_year_id, curriculum_id, department_section_id)
-         VALUES (?, ?, ?, ?, ?)`,
-        [
-          subject_id,
-          userId,
-          activeSchoolYearId,
-          curriculum_id,
-          department_section_id,
-        ],
-      );
+      await runWithSectionCapacity({
+        sectionId: department_section_id,
+        courseId: subject_id,
+        activeSchoolYearId,
+        mutation: (connection) =>
+          connection.query(
+            `INSERT INTO enrolled_subject
+              (course_id, student_number, active_school_year_id, curriculum_id, department_section_id)
+             VALUES (?, ?, ?, ?, ?)`,
+            [
+              subject_id,
+              userId,
+              activeSchoolYearId,
+              curriculum_id,
+              department_section_id,
+            ],
+          ),
+      });
 
       res.json({ message: "Other department course enrolled successfully" });
     } catch (err) {
       console.error("Error in /add-other-department-enrolled-course:", err);
-      return res.status(500).json({ error: err.message });
+      return sendCourseTaggingError(res, err);
     }
   },
 );
@@ -1938,31 +2102,49 @@ router.put("/update-active-curriculum", async (req, res) => {
     ];
 
     let remappedEnrolledSubjects = 0;
-    if (curriculumIds.length > 0) {
-      const [remapResult] = await db3.query(
+    const connection = await db3.getConnection();
+
+    try {
+      await connection.beginTransaction();
+
+      const curriculumFilter = curriculumIds.length
+        ? `AND curriculum_id IN (${curriculumIds.map(() => "?").join(", ")})`
+        : "";
+      const [subjectsToRemap] = await connection.query(
         `
-        UPDATE enrolled_subject
-        SET department_section_id = ?
+        SELECT id, course_id
+        FROM enrolled_subject
         WHERE student_number = ?
           AND active_school_year_id = ?
-          AND curriculum_id IN (${curriculumIds.map(() => "?").join(", ")})
+          ${curriculumFilter}
           AND (department_section_id IS NULL OR department_section_id = 0)
+        ORDER BY course_id, id
+        FOR UPDATE
         `,
-        [departmentSectionId, studentId, activeSchoolYearId, ...curriculumIds],
+        [studentId, activeSchoolYearId, ...curriculumIds],
       );
-      remappedEnrolledSubjects = remapResult.affectedRows || 0;
-    } else {
-      const [remapResult] = await db3.query(
-        `
-        UPDATE enrolled_subject
-        SET department_section_id = ?
-        WHERE student_number = ?
-          AND active_school_year_id = ?
-          AND (department_section_id IS NULL OR department_section_id = 0)
-        `,
-        [departmentSectionId, studentId, activeSchoolYearId],
-      );
-      remappedEnrolledSubjects = remapResult.affectedRows || 0;
+
+      for (const enrolledSubject of subjectsToRemap) {
+        await assertSectionCapacity({
+          connection,
+          sectionId: departmentSectionId,
+          courseId: enrolledSubject.course_id,
+          activeSchoolYearId,
+        });
+
+        const [remapResult] = await connection.query(
+          `UPDATE enrolled_subject SET department_section_id = ? WHERE id = ?`,
+          [departmentSectionId, enrolledSubject.id],
+        );
+        remappedEnrolledSubjects += remapResult.affectedRows || 0;
+      }
+
+      await connection.commit();
+    } catch (err) {
+      await connection.rollback();
+      throw err;
+    } finally {
+      connection.release();
     }
 
     res.status(200).json({
@@ -1974,7 +2156,7 @@ router.put("/update-active-curriculum", async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating active curriculum:", err);
-    res.status(500).json({ error: "Database error", details: err.message });
+    return sendCourseTaggingError(res, err);
   }
 });
 
@@ -2016,10 +2198,27 @@ router.put("/enrolled-courses/:id/section", async (req, res) => {
       return res.status(404).json({ error: "Enrolled course not found" });
     }
 
-    const [result] = await db3.query(
-      `UPDATE enrolled_subject SET department_section_id = ? WHERE id = ?`,
-      [department_section_id, id],
-    );
+    if (
+      String(before.department_section_id || "") ===
+      String(department_section_id)
+    ) {
+      return res.json({
+        message: "Enrolled subject is already assigned to this section",
+        id: Number(id),
+        department_section_id: Number(department_section_id),
+      });
+    }
+
+    const [result] = await runWithSectionCapacity({
+      sectionId: department_section_id,
+      courseId: before.course_id,
+      activeSchoolYearId: before.active_school_year_id,
+      mutation: (connection) =>
+        connection.query(
+          `UPDATE enrolled_subject SET department_section_id = ? WHERE id = ?`,
+          [department_section_id, id],
+        ),
+    });
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: "Enrolled course not found" });
@@ -2040,7 +2239,7 @@ router.put("/enrolled-courses/:id/section", async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating enrolled subject section:", err);
-    return res.status(500).json({ error: "Database error" });
+    return sendCourseTaggingError(res, err);
   }
 });
 
@@ -2134,7 +2333,7 @@ router.get("/subject-enrollment-count", async (req, res) => {
     const sql = `
       SELECT
         es.course_id,
-        COUNT(*) AS enrolled_count
+        COUNT(DISTINCT es.student_number) AS enrolled_count
       FROM enrolled_subject AS es
       WHERE es.active_school_year_id = ?
         AND es.department_section_id = ?
