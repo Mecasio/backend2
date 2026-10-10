@@ -41,16 +41,20 @@ const buildReportSource = ({
   const conditions = [
     "es.active_school_year_id = ?",
     "pt.components = ?",
-    "ct.lock_status = 1",
   ];
   const params = [activeSchoolYearId, campusId];
+
+  // Enrolled reports with "All" curricula should include students assigned
+  // to inactive curricula. Keep the active-curriculum restriction for
+  // migrated reports and when a specific curriculum is selected.
+  if (type !== "enrolled" || !isAll(curriculumId)) {
+    conditions.push("ct.lock_status = 1");
+  }
 
   if (type === "migrated") {
     conditions.push("LOWER(TRIM(COALESCE(es.remarks, ''))) = 'migrated from old system'");
   } else {
     conditions.push(
-      "es.department_section_id IS NOT NULL",
-      "es.department_section_id <> 0",
       `EXISTS (
         SELECT 1
         FROM unifast AS u

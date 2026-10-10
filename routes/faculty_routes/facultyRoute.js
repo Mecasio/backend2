@@ -859,6 +859,38 @@ const sumScheduleHours = (rows) =>
     return sum + Math.max(0, end - start);
   }, 0);
 
+const isBreakWorkload = (row) => {
+  const workloadLabel = `${row.workload_description || ""} ${row.workload_code || ""}`
+    .toUpperCase();
+  return workloadLabel.includes("BREAK") || /\bBRKS?\b/.test(workloadLabel);
+};
+
+const isDesignationWorkload = (row) => {
+  if (
+    Number(row.ishonorarium) === 1 ||
+    Number(row.is_servicecredit) === 1 ||
+    Number(row.is_temporary_substitution) === 1
+  ) {
+    return false;
+  }
+
+  const description = String(row.workload_description || "")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "");
+  const code = String(row.workload_code || "")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "");
+  const separateCategoryTokens = [
+    "RESEARCH", "RES", "EXTENSION", "EXT", "PRODUCTION", "PROD",
+    "ACCREDITATION", "ACC", "CONSULTATION", "CONS", "LESSONPREPARATION", "LPOC",
+  ];
+
+  return !(
+    separateCategoryTokens.some((token) => description === token || description.startsWith(token)) ||
+    separateCategoryTokens.includes(code)
+  );
+};
+
 const buildDailyHours = (rows) => {
   const buckets = {};
   rows.forEach((row) => {
@@ -992,25 +1024,13 @@ router.get("/faculty_dashboard_summary/:prof_id", async (req, res) => {
     const syId = activeYear.school_year_id;
 
     const [
-      [designationSlots],
       [teachingClasses],
       [studentSummary],
       [gradesSummary],
       [evaluationSummary],
       [classRows],
-      [teachingSlots],
+      [workloadHourRows],
     ] = await Promise.all([
-      db3.query(
-        `
-        SELECT tt.school_time_start, tt.school_time_end
-        FROM time_table AS tt
-        INNER JOIN course_table AS ct ON tt.course_id = ct.course_id
-        WHERE tt.professor_id = ?
-          AND tt.school_year_id = ?
-          AND ct.office_duty = 1
-        `,
-        [prof_id, syId],
-      ),
       db3.query(
         `
         SELECT DISTINCT
@@ -1132,13 +1152,24 @@ router.get("/faculty_dashboard_summary/:prof_id", async (req, res) => {
         SELECT
           rdt.description AS day,
           tt.school_time_start,
-          tt.school_time_end
+          tt.school_time_end,
+          tt.department_section_id,
+          tt.ishonorarium,
+          tt.is_servicecredit,
+          tt.is_temporary_substitution,
+          COALESCE(ct.course_description, wt.workload_description) AS workload_description,
+          COALESCE(ct.course_code, wt.workload_code) AS workload_code
         FROM time_table AS tt
-        INNER JOIN course_table AS ct ON tt.course_id = ct.course_id
+        LEFT JOIN course_table AS ct
+          ON tt.course_id = ct.course_id
+          AND tt.department_section_id IS NOT NULL
+          AND tt.department_section_id <> 0
+        LEFT JOIN workload_type AS wt
+          ON tt.course_id = wt.id
+          AND (tt.department_section_id IS NULL OR tt.department_section_id = 0)
         LEFT JOIN room_day_table AS rdt ON tt.room_day = rdt.id
         WHERE tt.professor_id = ?
           AND tt.school_year_id = ?
-          AND ct.office_duty = 0
         `,
         [prof_id, syId],
       ),
@@ -1167,9 +1198,15 @@ router.get("/faculty_dashboard_summary/:prof_id", async (req, res) => {
       ? Math.round((totalEvaluations / totalStudents) * 100)
       : 0;
 
+    const workloadHourSlots = workloadHourRows.filter((row) => !isBreakWorkload(row));
+    const designationSlots = workloadHourSlots.filter(
+      (row) =>
+        (row.department_section_id == null || Number(row.department_section_id) === 0) &&
+        isDesignationWorkload(row),
+    );
+    const totalWorkloadMinutes = sumScheduleHours(workloadHourSlots);
     const designationMinutes = sumScheduleHours(designationSlots);
-    const teachingMinutes = sumScheduleHours(teachingSlots);
-    const dailyHours = buildDailyHours(teachingSlots);
+    const dailyHours = buildDailyHours(workloadHourSlots);
 
     const classMap = new Map();
     classRows.forEach((row) => {
@@ -1239,7 +1276,7 @@ router.get("/faculty_dashboard_summary/:prof_id", async (req, res) => {
         status: getEvaluationStatus(overallRating),
       },
       working_hours: {
-        total_hours: minutesToHours(teachingMinutes),
+        total_hours: minutesToHours(totalWorkloadMinutes),
         daily: dailyHours,
       },
       my_classes: Array.from(classMap.values()),

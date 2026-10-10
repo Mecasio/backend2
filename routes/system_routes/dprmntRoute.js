@@ -257,7 +257,6 @@ router.get("/department/:id/organization", async (req, res) => {
          org.curriculum_id,
          org.employee_id,
          org.position,
-         org.start_date,
          pr.fname,
          pr.mname,
          pr.lname,
@@ -423,7 +422,7 @@ router.put("/department/:id/organization", CanEdit, async (req, res) => {
       if (!desired || String(desired.employeeId) !== String(current.employee_id)) {
         await connection.query(
           `UPDATE dprtmnt_org
-           SET status = 0, end_date = CURRENT_DATE
+           SET status = 0
            WHERE dprtmnt_org_id = ?`,
           [current.dprtmnt_org_id],
         );
@@ -438,8 +437,8 @@ router.put("/department/:id/organization", CanEdit, async (req, res) => {
 
       await connection.query(
         `INSERT INTO dprtmnt_org
-           (dprtmnt_id, curriculum_id, employee_id, position, start_date, status)
-         VALUES (?, ?, ?, ?, CURRENT_DATE, 1)`,
+           (dprtmnt_id, curriculum_id, employee_id, position, status)
+         VALUES (?, ?, ?, ?, 1)`,
         [id, desired.curriculumId, desired.employeeId, desired.position],
       );
     }

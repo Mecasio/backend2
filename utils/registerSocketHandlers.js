@@ -5,6 +5,10 @@ const {
   getSenderAccountForEmail,
   createScheduleLabelHelpers,
 } = require("../socket/socketHelpers");
+const {
+  validateDesignationSchedule,
+  validateRegularSchedule,
+} = require("./scheduleConflictValidation");
 
 module.exports = function registerSocketHandlers({
   app,
@@ -1340,122 +1344,9 @@ WHERE proctor LIKE ?
 
   //CHECK CONFLICT
   app.post("/api/check-conflict", async (req, res) => {
-    const {
-      day,
-      start_time,
-      end_time,
-      section_id,
-      school_year_id,
-      prof_id,
-      room_id,
-      subject_id,
-    } = req.body;
-
     try {
-      const start_time_m = timeToMinutes(start_time);
-      const end_time_m = timeToMinutes(end_time);
-
-      const countQuery = `
-      SELECT COUNT(*) AS subject_count
-      FROM time_table
-      WHERE department_section_id = ?
-        AND school_year_id = ?
-        AND professor_id = ?
-        AND department_room_id = ?
-        AND course_id = ?
-    `;
-      const [countResult] = await db3.query(countQuery, [
-        section_id,
-        school_year_id,
-        prof_id,
-        room_id,
-        subject_id,
-      ]);
-
-      if (countResult[0].subject_count >= 2) {
-        return res.status(409).json({
-          conflict: true,
-          message:
-            "This subject is already assigned twice for the same section, room, school year, and professor.",
-        });
-      }
-
-      const query = `
-      SELECT * FROM time_table
-      WHERE department_section_id = ?
-        AND school_year_id = ?
-        AND course_id = ?
-        AND room_day = ?
-    `;
-
-      const [subjectResult] = await db3.query(query, [
-        section_id,
-        school_year_id,
-        subject_id,
-        day,
-      ]);
-
-      if (subjectResult.length > 0) {
-        return res.status(409).json({
-          conflict: true,
-          message:
-            "This subject is already assigned in this section and school year on the same day.",
-        });
-      }
-
-      // Check for time conflicts (prof, section, room)
-      const checkTimeQuery = `
-      SELECT * FROM time_table
-      WHERE room_day = ?
-        AND school_year_id = ?
-        AND (professor_id = ? OR department_section_id = ? OR department_room_id = ?)
-        AND (
-          (? > TIME_TO_SEC(STR_TO_DATE(school_time_start, '%l:%i %p'))/60
-          AND ? < TIME_TO_SEC(STR_TO_DATE(school_time_end, '%l:%i %p'))/60)
-          OR
-          (? > TIME_TO_SEC(STR_TO_DATE(school_time_start, '%l:%i %p'))/60
-          AND ? < TIME_TO_SEC(STR_TO_DATE(school_time_end, '%l:%i %p'))/60)
-          OR
-          (TIME_TO_SEC(STR_TO_DATE(school_time_start, '%l:%i %p'))/60 > ?
-          AND TIME_TO_SEC(STR_TO_DATE(school_time_start, '%l:%i %p'))/60 < ?)
-          OR
-          (TIME_TO_SEC(STR_TO_DATE(school_time_end, '%l:%i %p'))/60 > ?
-          AND TIME_TO_SEC(STR_TO_DATE(school_time_end, '%l:%i %p'))/60 < ?)
-          OR
-          (TIME_TO_SEC(STR_TO_DATE(school_time_start, '%l:%i %p'))/60 = ?
-          AND TIME_TO_SEC(STR_TO_DATE(school_time_end, '%l:%i %p'))/60 = ?)
-        )
-    `;
-
-      const [timeResult] = await db3.query(checkTimeQuery, [
-        day,
-        school_year_id,
-        prof_id,
-        section_id,
-        room_id,
-        start_time_m,
-        start_time_m,
-        end_time_m,
-        end_time_m,
-        start_time_m,
-        end_time_m,
-        start_time_m,
-        end_time_m,
-        start_time_m,
-        end_time_m,
-      ]);
-
-      if (timeResult.length > 0) {
-        return res.status(409).json({
-          conflict: true,
-          message:
-            "Schedule conflict detected! Please choose a different time.",
-        });
-      }
-
-      return res
-        .status(200)
-        .json({ conflict: false, message: "Schedule is available." });
+      const validation = await validateRegularSchedule(db3, req.body);
+      return res.status(validation.status).json(validation);
     } catch (error) {
       console.error("Database query error:", error);
       return res.status(500).json({ error: "Internal server error" });
@@ -1723,6 +1614,7 @@ WHERE proctor LIKE ?
       !day ||
       !start_time ||
       !end_time ||
+      !section_id ||
       !school_year_id ||
       !prof_id ||
       !room_id ||
@@ -1751,7 +1643,39 @@ WHERE proctor LIKE ?
       });
     }
 
+    let connection;
+    const lockName = `schedule:${school_year_id}:${day}`;
+    let lockAcquired = false;
+
     try {
+      connection = await db3.getConnection();
+      const [[lockResult]] = await connection.query("SELECT GET_LOCK(?, 5) AS acquired", [
+        lockName,
+      ]);
+      lockAcquired = Number(lockResult?.acquired) === 1;
+      if (!lockAcquired) {
+        return res.status(503).json({
+          conflict: true,
+          message: "Schedule validation is busy. Please try again.",
+        });
+      }
+
+      await connection.beginTransaction();
+      const validation = await validateRegularSchedule(connection, {
+        day,
+        start_time,
+        end_time,
+        section_id,
+        subject_id,
+        prof_id,
+        room_id,
+        school_year_id,
+      });
+      if (validation.conflict) {
+        await connection.rollback();
+        return res.status(validation.status).json(validation);
+      }
+
       const query = `
       SELECT * FROM time_table
       WHERE department_section_id = ?
@@ -1760,7 +1684,7 @@ WHERE proctor LIKE ?
         AND room_day = ?
     `;
 
-      const [subjectResult] = await db3.query(query, [
+      const [subjectResult] = await connection.query(query, [
         section_id,
         school_year_id,
         subject_id,
@@ -1768,6 +1692,7 @@ WHERE proctor LIKE ?
       ]);
 
       if (subjectResult.length > 0) {
+        await connection.rollback();
         return res.status(409).json({
           conflict: true,
           message:
@@ -1799,7 +1724,7 @@ WHERE proctor LIKE ?
         )
     `;
 
-      const [timeResult] = await db3.query(checkTimeQuery, [
+      const [timeResult] = await connection.query(checkTimeQuery, [
         day,
         school_year_id,
         prof_id,
@@ -1818,6 +1743,7 @@ WHERE proctor LIKE ?
       ]);
 
       if (timeResult.length > 0) {
+        await connection.rollback();
         return res.status(409).json({
           conflict: true,
           message:
@@ -1831,7 +1757,7 @@ WHERE proctor LIKE ?
       (room_day, school_time_start, school_time_end, department_section_id, course_id, ishonorarium, is_servicecredit, is_temporary_substitution, professor_id, department_room_id, school_year_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
-      await db3.query(insertQuery, [
+      await connection.query(insertQuery, [
         day,
         start_time,
         end_time,
@@ -1845,10 +1771,21 @@ WHERE proctor LIKE ?
         school_year_id,
       ]);
 
+      await connection.commit();
       res.status(200).json({ message: "Schedule inserted successfully" });
     } catch (error) {
+      try {
+        await connection.rollback();
+      } catch {}
       console.error("Error inserting schedule:", error);
       res.status(500).json({ error: "Failed to insert schedule" });
+    } finally {
+      if (connection && lockAcquired) {
+        try {
+          await connection.query("SELECT RELEASE_LOCK(?)", [lockName]);
+        } catch {}
+      }
+      connection?.release();
     }
   });
 
@@ -2977,6 +2914,7 @@ WHERE proctor LIKE ?
         st.description AS section_description,
         rt.room_description,
         COALESCE(cst.course_code, wt.workload_code) AS course_code,
+        COALESCE(cst.course_description, wt.workload_description) AS load_description,
         cst.course_description,
         cst.course_unit,
         wt.workload_color,
@@ -3006,6 +2944,102 @@ WHERE proctor LIKE ?
     } catch (err) {
       console.error(err);
       res.status(500).send("DB Error");
+    }
+  });
+
+  app.get("/api/faculty-workload-signatories/:profId", async (req, res) => {
+    const { profId } = req.params;
+
+    try {
+      const [[departmentAssignment]] = await db3.execute(
+        `SELECT dprtmnt_id
+         FROM dprtmnt_profs_table
+         WHERE prof_id = ?
+         ORDER BY dprtmnt_profs_id DESC
+         LIMIT 1`,
+        [profId],
+      );
+
+      if (!departmentAssignment?.dprtmnt_id) {
+        return res.json({});
+      }
+
+      const [[primaryCurriculum]] = await db3.execute(
+        `SELECT dst.curriculum_id
+         FROM time_table tt
+         INNER JOIN active_school_year_table sy ON sy.id = tt.school_year_id
+         INNER JOIN dprtmnt_section_table dst ON dst.id = tt.department_section_id
+         INNER JOIN dprtmnt_curriculum_table dc
+           ON dc.curriculum_id = dst.curriculum_id
+          AND dc.dprtmnt_id = ?
+         WHERE tt.professor_id = ?
+           AND sy.astatus = 1
+           AND dst.curriculum_id IS NOT NULL
+         GROUP BY dst.curriculum_id
+         ORDER BY SUM(
+           GREATEST(
+             0,
+             TIME_TO_SEC(STR_TO_DATE(tt.school_time_end, '%l:%i %p')) -
+             TIME_TO_SEC(STR_TO_DATE(tt.school_time_start, '%l:%i %p'))
+           )
+         ) DESC, dst.curriculum_id
+         LIMIT 1`,
+        [departmentAssignment.dprtmnt_id, profId],
+      );
+
+      const [[signatories]] = await db3.execute(
+        `SELECT
+           TRIM(CONCAT_WS(
+             ' ', chair_prof.fname,
+             CASE
+               WHEN NULLIF(TRIM(chair_prof.mname), '') IS NULL THEN NULL
+               ELSE CONCAT(LEFT(TRIM(chair_prof.mname), 1), '.')
+             END,
+             chair_prof.lname
+           )) AS prepared_by_name,
+           CASE
+             WHEN chair_org.dprtmnt_org_id IS NULL OR program.program_code IS NULL THEN ''
+             ELSE CONCAT(program.program_code, ', Program Chair')
+           END AS prepared_by_title,
+           TRIM(CONCAT_WS(
+             ' ', dean_prof.fname,
+             CASE
+               WHEN NULLIF(TRIM(dean_prof.mname), '') IS NULL THEN NULL
+               ELSE CONCAT(LEFT(TRIM(dean_prof.mname), 1), '.')
+             END,
+             dean_prof.lname
+           )) AS certified_by_name,
+           CASE
+             WHEN dean_org.dprtmnt_org_id IS NULL THEN ''
+             ELSE CONCAT('Dean, ', COALESCE(dept.dprtmnt_code, ''))
+           END AS certified_by_title
+         FROM dprtmnt_table dept
+         LEFT JOIN dprtmnt_org chair_org
+           ON chair_org.dprtmnt_id = dept.dprtmnt_id
+          AND chair_org.curriculum_id = ?
+          AND chair_org.position = 'PROGRAM_CHAIR'
+          AND chair_org.status = 1
+         LEFT JOIN prof_table chair_prof
+           ON chair_prof.employee_id = chair_org.employee_id
+         LEFT JOIN curriculum_table chair_curriculum
+           ON chair_curriculum.curriculum_id = chair_org.curriculum_id
+         LEFT JOIN program_table program
+           ON program.program_id = chair_curriculum.program_id
+         LEFT JOIN dprtmnt_org dean_org
+           ON dean_org.dprtmnt_id = dept.dprtmnt_id
+          AND dean_org.position = 'DEAN'
+          AND dean_org.status = 1
+         LEFT JOIN prof_table dean_prof
+           ON dean_prof.employee_id = dean_org.employee_id
+         WHERE dept.dprtmnt_id = ?
+         LIMIT 1`,
+        [primaryCurriculum?.curriculum_id || null, departmentAssignment.dprtmnt_id],
+      );
+
+      return res.json(signatories || {});
+    } catch (err) {
+      console.error("Error fetching faculty workload signatories:", err);
+      return res.status(500).json({ error: "Failed to fetch faculty workload signatories" });
     }
   });
 
@@ -3612,7 +3646,14 @@ WHERE proctor LIKE ?
     const { day, start_time, end_time, subject_id, prof_id, school_year_id } =
       req.body;
 
-    if (!day || !start_time || !end_time || !school_year_id || !prof_id) {
+    if (
+      !day ||
+      !start_time ||
+      !end_time ||
+      !school_year_id ||
+      !prof_id ||
+      !subject_id
+    ) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
@@ -3636,13 +3677,43 @@ WHERE proctor LIKE ?
       });
     }
 
+    let connection;
+    const lockName = `schedule:${school_year_id}:${day}`;
+    let lockAcquired = false;
+
     try {
+      connection = await db3.getConnection();
+      const [[lockResult]] = await connection.query("SELECT GET_LOCK(?, 5) AS acquired", [
+        lockName,
+      ]);
+      lockAcquired = Number(lockResult?.acquired) === 1;
+      if (!lockAcquired) {
+        return res.status(503).json({
+          conflict: true,
+          message: "Schedule validation is busy. Please try again.",
+        });
+      }
+
+      await connection.beginTransaction();
+      const validation = await validateDesignationSchedule(connection, {
+        day,
+        start_time,
+        end_time,
+        subject_id,
+        prof_id,
+        school_year_id,
+      });
+      if (validation.conflict) {
+        await connection.rollback();
+        return res.status(validation.status).json(validation);
+      }
+
       // Check for time conflicts (prof, section, room)
       const checkTimeQuery = `
       SELECT * FROM time_table
       WHERE room_day = ?
         AND school_year_id = ?
-        AND (professor_id = ? OR department_section_id = ?)
+        AND professor_id = ?
         AND (
           (? > TIME_TO_SEC(STR_TO_DATE(school_time_start, '%l:%i %p'))/60
           AND ? < TIME_TO_SEC(STR_TO_DATE(school_time_end, '%l:%i %p'))/60)
@@ -3661,7 +3732,7 @@ WHERE proctor LIKE ?
         )
     `;
 
-      const [timeResult] = await db3.query(checkTimeQuery, [
+      const [timeResult] = await connection.query(checkTimeQuery, [
         day,
         school_year_id,
         prof_id,
@@ -3675,13 +3746,10 @@ WHERE proctor LIKE ?
         endMinutes,
         startMinutes,
         endMinutes,
-        startMinutes,
-        endMinutes,
-        startMinutes,
-        endMinutes,
       ]);
 
       if (timeResult.length > 0) {
+        await connection.rollback();
         return res.status(409).json({
           conflict: true,
           message:
@@ -3695,7 +3763,7 @@ WHERE proctor LIKE ?
       (room_day, school_time_start, school_time_end, department_section_id, course_id, professor_id, department_room_id, school_year_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `;
-      await db3.query(insertQuery, [
+      await connection.query(insertQuery, [
         day,
         start_time,
         end_time,
@@ -3706,10 +3774,21 @@ WHERE proctor LIKE ?
         school_year_id,
       ]);
 
+      await connection.commit();
       res.status(200).json({ message: "Schedule inserted successfully" });
     } catch (error) {
+      try {
+        await connection.rollback();
+      } catch {}
       console.error("Error inserting schedule:", error);
       res.status(500).json({ error: "Failed to insert schedule" });
+    } finally {
+      if (connection && lockAcquired) {
+        try {
+          await connection.query("SELECT RELEASE_LOCK(?)", [lockName]);
+        } catch {}
+      }
+      connection?.release();
     }
   });
 
@@ -4446,16 +4525,28 @@ WHERE proctor LIKE ?
 
   app.get("/api/faculty_masterlist_bootstrap/:userID", async (req, res) => {
     const { userID } = req.params;
+    const requestedSchoolYearId = req.query.school_year_id;
+    const requestedCourseId = req.query.course_id;
 
     try {
-      const [[activeYear]] = await db3.query(
-        `
-        SELECT sy.id AS school_year_id, sy.year_id, sy.semester_id
-        FROM active_school_year_table AS sy
-        WHERE sy.astatus = 1
-        LIMIT 1
-        `,
-      );
+      const [[activeYear]] = requestedSchoolYearId
+        ? await db3.query(
+          `
+          SELECT sy.id AS school_year_id, sy.year_id, sy.semester_id
+          FROM active_school_year_table AS sy
+          WHERE sy.id = ?
+          LIMIT 1
+          `,
+          [requestedSchoolYearId],
+        )
+        : await db3.query(
+          `
+          SELECT sy.id AS school_year_id, sy.year_id, sy.semester_id
+          FROM active_school_year_table AS sy
+          WHERE sy.astatus = 1
+          LIMIT 1
+          `,
+        );
 
       if (!activeYear) {
         return res.json({
@@ -4485,8 +4576,12 @@ WHERE proctor LIKE ?
         [userID, activeYear.school_year_id],
       );
 
-      const firstCourseId = courses[0]?.course_id || null;
-      const [sections] = firstCourseId
+      const selectedCourseId = courses.some(
+        (course) => String(course.course_id) === String(requestedCourseId),
+      )
+        ? requestedCourseId
+        : courses[0]?.course_id || null;
+      const [sections] = selectedCourseId
         ? await db3.query(
           `
             SELECT DISTINCT
@@ -4504,7 +4599,7 @@ WHERE proctor LIKE ?
             GROUP BY tt.department_section_id
             ORDER BY section_description
             `,
-          [userID, firstCourseId, activeYear.school_year_id],
+          [userID, selectedCourseId, activeYear.school_year_id],
         )
         : [[]];
 
@@ -7358,10 +7453,12 @@ WHERE proctor LIKE ?
         pt.mname,
         pt.lname,
         COALESCE(ct.course_code, wt.workload_code) AS course_code,
+        COALESCE(ct.course_description, wt.workload_description) AS load_description,
         wt.workload_color,
         pgt.program_id,
         pgt.program_code,
         sct.description AS section_description,
+        tt.department_section_id,
         rdt.description AS day,
         tt.school_time_start,
         tt.school_time_end,

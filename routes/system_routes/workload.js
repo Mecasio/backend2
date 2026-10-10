@@ -2,6 +2,9 @@ const express = require('express');
 const { db3 } = require('../database/database');
 const { insertAuditLogEnrollment, resolveAuditActor } = require("../../utils/auditLogger");
 const { resolveUserMacAddress } = require("../../utils/macAddress");
+const {
+    validateDesignationSchedule,
+} = require("../../utils/scheduleConflictValidation");
 const router = express.Router();
 
 const WORKLOAD_HOUR_LIMIT = 40;
@@ -200,49 +203,6 @@ async function checkDesignationConflicts({
 
     const overlapParams = getOverlapBindParams(startMinutes, endMinutes);
 
-    let duplicateTimeTableQuery = `
-      SELECT id FROM time_table
-      WHERE room_day = ?
-        AND school_year_id = ?
-        AND professor_id = ?
-        AND course_id = ?
-    `;
-    const duplicateTimeTableParams = [day, school_year_id, prof_id, subject_id];
-    if (exclude_schedule_id) {
-        duplicateTimeTableQuery += " AND id != ?";
-        duplicateTimeTableParams.push(exclude_schedule_id);
-    }
-
-    const [duplicateTimeTable] = await db3.query(
-        duplicateTimeTableQuery,
-        duplicateTimeTableParams
-    );
-    if (duplicateTimeTable.length > 0) {
-        return {
-            conflict: true,
-            status: 409,
-            message:
-                "This designation is already assigned to the professor on the selected day.",
-        };
-    }
-
-    const [duplicateFacultyWorkload] = await db3.query(
-        `SELECT id FROM faculty_workload
-         WHERE day = ?
-           AND school_year_id = ?
-           AND prof_id = ?
-           AND workload_id = ?`,
-        [day, school_year_id, prof_id, subject_id]
-    );
-    if (duplicateFacultyWorkload.length > 0) {
-        return {
-            conflict: true,
-            status: 409,
-            message:
-                "This designation already exists in the faculty workload on the selected day.",
-        };
-    }
-
     let timeTableConflictQuery = `
       SELECT id FROM time_table
       WHERE room_day = ?
@@ -270,11 +230,12 @@ async function checkDesignationConflicts({
     }
 
     const facultyWorkloadConflictQuery = `
-      SELECT id FROM faculty_workload
-      WHERE day = ?
-        AND school_year_id = ?
-        AND prof_id = ?
-        AND ${buildTimeOverlapCondition("start", "end")}
+      SELECT fw.id FROM faculty_workload fw
+      INNER JOIN prof_table pt ON pt.employee_id = fw.employee_id
+      WHERE fw.day = ?
+        AND fw.school_year_id = ?
+        AND pt.prof_id = ?
+        AND ${buildTimeOverlapCondition("fw.start", "fw.end")}
     `;
     const [facultyWorkloadConflicts] = await db3.query(
         facultyWorkloadConflictQuery,
@@ -440,7 +401,7 @@ router.post("/check-conflict-designation", async (req, res) => {
     }
 
     try {
-        const result = await checkDesignationConflicts({
+        const result = await validateDesignationSchedule(db3, {
             day,
             start_time,
             end_time,
@@ -478,7 +439,7 @@ router.post("/check-designation", async (req, res) => {
     }
 
     try {
-        const result = await checkDesignationConflicts({
+        const result = await validateDesignationSchedule(db3, {
             day: day_of_week,
             start_time: start_time || "7:00 AM",
             end_time: end_time || "7:30 AM",
